@@ -1,0 +1,79 @@
+name: Build & Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-image:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      # GHCR image names must be lowercase, so lowercase the owner name
+      - name: Compute image name
+        id: vars
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/app" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.image }}:latest
+            ${{ steps.vars.outputs.image }}:${{ github.sha }}
+
+  deploy-vps:
+    name: Deploy to VPS via SSH
+    runs-on: ubuntu-latest
+    needs: build-image
+    permissions:
+      packages: read
+    steps:
+      - name: Thực thi câu lệnh triển khai trên VPS qua SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          IMAGE: ${{ needs.build-image.outputs.image }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          envs: IMAGE,GHCR_USER,GHCR_TOKEN
+          script: |
+            set -e
+
+            echo ">>> Logging in to GHCR"
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+            echo ">>> Pulling latest image"
+            docker pull "$IMAGE:latest"
+
+            echo ">>> Restarting container"
+            docker stop app || true
+            docker rm app || true
+            docker run -d --name app --restart unless-stopped -p 8080:8080 "$IMAGE:latest"
+
+            echo ">>> Cleaning up"
+            docker logout ghcr.io
+            docker image prune -f
+
+            echo ">>> Running containers"
+            docker ps --filter "name=app"
